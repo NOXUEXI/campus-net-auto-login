@@ -1,0 +1,10 @@
+# 本地配置与凭据，切勿提交
+config.json
+cred.dat
+login.log
+
+# 系统杂项
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

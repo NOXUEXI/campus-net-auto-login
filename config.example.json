@@ -1,0 +1,9 @@
+{
+  "portal": "http://10.0.0.1",
+  "username": "your-student-id",
+  "nasId": "1",
+  "switchip": "",
+  "dialWaitSeconds": 3,
+  "dialMaxTries": 12,
+  "notifyCooldownMinutes": 30
+}
