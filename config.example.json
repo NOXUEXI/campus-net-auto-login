@@ -5,5 +5,11 @@
   "switchip": "",
   "dialWaitSeconds": 3,
   "dialMaxTries": 12,
+  "reachRetries": 30,
+  "reachGapSeconds": 5,
+  "wifiSsid": ["YourCampusSSID"],
+  "wifiAutoSwitch": true,
+  "wifiFixWindowMinutes": 15,
+  "wifiWaitSeconds": 25,
   "notifyCooldownMinutes": 30
 }

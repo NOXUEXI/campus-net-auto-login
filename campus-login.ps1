@@ -1,5 +1,5 @@
 <#
-  CampusNetAutoLogin - campus portal auto login (WUST unified auth)
+  CampusNetAutoLogin - campus portal auto login (unified auth portal)
   ------------------------------------------------------------------
   Source is intentionally ASCII-only so that Windows PowerShell 5.1
   reads it correctly regardless of the system ANSI code page.
@@ -13,7 +13,8 @@
 param(
     [switch]$Force,       # log even when already online
     [switch]$Status,      # print a status summary and exit
-    [switch]$ForceLogin   # skip the "already online" shortcut and really submit credentials
+    [switch]$ForceLogin,  # skip the "already online" shortcut and really submit credentials
+    [switch]$WifiDiag     # print the wifi / SSID diagnosis and exit (read-only)
 )
 
 $ErrorActionPreference = 'Stop'
@@ -24,7 +25,7 @@ $ConfigPath = Join-Path $Root 'config.json'
 $CredPath   = Join-Path $Root 'cred.dat'
 $StatePath  = Join-Path $Root 'state.json'
 $LogPath    = Join-Path $Root 'login.log'
-$MaxLogLines = 400
+$MaxLogLines = 1000    # every run now writes one line, so keep more history
 
 # ------------------------------------------------------- single instance
 $script:Mutex = $null
@@ -41,7 +42,7 @@ function Write-Log {
         Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8
         $all = @(Get-Content -LiteralPath $LogPath -ErrorAction SilentlyContinue)
         if ($all.Count -gt $MaxLogLines) {
-            $all | Select-Object -Last 250 | Set-Content -LiteralPath $LogPath -Encoding UTF8
+            $all | Select-Object -Last 600 | Set-Content -LiteralPath $LogPath -Encoding UTF8
         }
     } catch { }
 }
@@ -151,7 +152,8 @@ function Wait-Dial {
 
 # ----------------------------------------------------------- credential
 function Get-PlainPassword {
-    # [IO.File]::ReadAllText + Trim: cred.dat 结尾若带换行，ConvertTo-SecureString 会报格式错误
+    # [IO.File]::ReadAllText + Trim: a trailing newline in cred.dat would make
+    # ConvertTo-SecureString fail with a format error.
     $sec  = ConvertTo-SecureString ([IO.File]::ReadAllText($CredPath).Trim())
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($sec)
     try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
@@ -179,6 +181,166 @@ function Show-Notify {
     } catch { }
 }
 
+# The portal sometimes demands a captcha (login answer code 2). Nothing can be
+# automated past that point, but we can put the login page in front of the user
+# so it takes two clicks instead of remembering the URL. Throttled hard so it
+# never turns into a window spam.
+function Show-PortalPage {
+    param([int]$CooldownMinutes = 30)
+    if (-not (Test-Throttle 'lastOpenPortal' $CooldownMinutes)) { return }
+    try {
+        Start-Process $script:BaseUrl | Out-Null
+        Write-Log ('opened portal page in browser: ' + $script:BaseUrl)
+    } catch { }
+}
+
+# ------------------------------------------------------------------ wifi
+# The other classic way this tool "breaks": Windows also has autoconnect on
+# for a phone hotspot or some other familiar network, so the laptop boots
+# straight onto that one. There IS internet, the portal is simply not there,
+# and the machine never comes back to the campus SSID on its own.
+#
+# Fix: check the SSID before probing the portal. Switching is guarded by four
+# conditions, because this laptop also travels (hotel / library / phone
+# hotspots are all saved profiles) and blindly forcing the campus SSID would
+# kill a perfectly good connection somewhere else:
+#   1. wifiAutoSwitch is on
+#   2. we are still inside the boot window (default 15 min)
+#   3. the campus profile is actually saved
+#   4. the campus SSID is currently visible, i.e. we really are on campus
+function Get-BootMinutes {
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        return [double]((Get-Date) - $os.LastBootUpTime).TotalMinutes
+    } catch { return -1 }
+}
+
+function Get-CurrentSsid {
+    try { $out = @(& netsh wlan show interfaces 2>$null) } catch { return '' }
+    foreach ($l in $out) {
+        if ($l -match '^\s*SSID\s*:\s*(.+?)\s*$') { return $Matches[1] }
+    }
+    return ''
+}
+
+function Test-WlanAdapter {
+    try {
+        $a = @(Get-NetAdapter -Physical -ErrorAction Stop |
+               Where-Object { $_.MediaType.ToString() -like '*802*' })
+        return ($a.Count -gt 0)
+    } catch { return $false }
+}
+
+function Test-SsidProfile {
+    param([string]$Name)
+    # Exact value comparison after the colon. A substring test would happily
+    # match "C" against "Campus-A" and report a profile that does not exist.
+    try {
+        $out = @(& netsh wlan show profiles 2>$null)
+        foreach ($l in $out) {
+            if ($l -match ':\s*([^:]+?)\s*$') {
+                if ($Matches[1] -eq $Name) { return $true }
+            }
+        }
+    } catch { }
+    return $false
+}
+
+function Test-SsidVisible {
+    param([string]$Name)
+    try {
+        $out = @(& netsh wlan show networks 2>$null)
+        foreach ($l in $out) {
+            if ($l -match '^\s*SSID\s+\d+\s*:\s*(.+?)\s*$') {
+                if ($Matches[1] -eq $Name) { return $true }
+            }
+        }
+    } catch { }
+    return $false
+}
+
+function Connect-Ssid {
+    param([string]$Name, [int]$WaitSeconds = 25)
+    $arg = 'name="' + $Name + '"'
+    try { & netsh wlan connect $arg | Out-Null } catch { }
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 3
+        if ((Get-CurrentSsid) -eq $Name) { return $true }
+    }
+    return $false
+}
+
+# One throttled channel for all wifi warnings: this runs every 5 minutes and
+# a laptop parked off campus would otherwise fill the log.
+function Write-WifiWarn {
+    param([string]$Message, [int]$Minutes = 30)
+    if (Test-Throttle 'lastWifiWarn' $Minutes) { Write-Log $Message 'WARN' }
+}
+
+function Ensure-Wifi {
+    param($Cfg)
+
+    # NOTE: build this with an explicit loop, never a pipeline. A pipeline that
+    # yields exactly one item collapses to a scalar string, and $want[0] would
+    # then return the first *character* - "C" out of "Campus-A". That bug is
+    # invisible while the expected SSID is already connected, and only shows up
+    # the moment a switch is actually needed.
+    $want = @()
+    foreach ($w in @($Cfg.wifiSsid)) {
+        if (-not [string]::IsNullOrWhiteSpace($w)) { $want += [string]$w }
+    }
+    if ($want.Count -eq 0) { return }
+
+    $cur = Get-CurrentSsid
+    if ($want -contains $cur) { return }
+
+    $where = 'none'
+    if (-not [string]::IsNullOrEmpty($cur)) { $where = $cur }
+    $list  = $want -join ', '
+
+    if (-not (Test-WlanAdapter)) {
+        Write-WifiWarn ('wifi: on "' + $where + '", expected one of [' + $list + '] - no WLAN adapter, skipping')
+        return
+    }
+
+    $auto = $true
+    if ($null -ne $Cfg.wifiAutoSwitch) { $auto = [bool]$Cfg.wifiAutoSwitch }
+    if (-not $auto) {
+        Write-WifiWarn ('wifi: on "' + $where + '", expected one of [' + $list + '] - auto switching disabled')
+        return
+    }
+
+    $window = 15
+    if ($Cfg.wifiFixWindowMinutes) { $window = [int]$Cfg.wifiFixWindowMinutes }
+    $boot = Get-BootMinutes
+    if ($boot -lt 0 -or $boot -gt $window) {
+        $b = 'unknown'
+        if ($boot -ge 0) { $b = [string][int]$boot }
+        Write-WifiWarn ('wifi: on "' + $where + '", expected one of [' + $list + ']; boot +' + $b + ' min is outside the ' + $window + ' min fix window - not switching')
+        return
+    }
+
+    $target = [string]$want[0]
+    if (-not (Test-SsidProfile $target)) {
+        Write-WifiWarn ('wifi: no saved profile for "' + $target + '" - cannot switch')
+        return
+    }
+    if (-not (Test-SsidVisible $target)) {
+        Write-WifiWarn ('wifi: "' + $target + '" is not in range - not switching (off campus?)')
+        return
+    }
+
+    $wait = 25
+    if ($Cfg.wifiWaitSeconds) { $wait = [int]$Cfg.wifiWaitSeconds }
+    Write-Log ('wifi: on "' + $where + '", switching to "' + $target + '"')
+    if (Connect-Ssid -Name $target -WaitSeconds $wait) {
+        Write-Log ('wifi: connected to "' + $target + '"')
+    } else {
+        Write-Log ('wifi: could not connect to "' + $target + '" within ' + $wait + 's') 'WARN'
+    }
+}
+
 # ================================================================ main
 try {
     if (-not (Test-Path -LiteralPath $ConfigPath)) {
@@ -188,17 +350,61 @@ try {
     $cfg = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
     $script:BaseUrl = [string]$cfg.portal
 
-    # --- reachability, with a few retries (Wi-Fi may still be coming up) ---
+    # --- wifi diagnosis (read-only) ----------------------------------------
+    # Deliberately placed before Ensure-Wifi so that -WifiDiag never touches
+    # the network. Answers "why is it not switching?" in one command.
+    if ($WifiDiag) {
+        try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
+        $want = @()
+        foreach ($w in @($cfg.wifiSsid)) {
+            if (-not [string]::IsNullOrWhiteSpace($w)) { $want += [string]$w }
+        }
+        Write-Host ('current ssid  : [' + (Get-CurrentSsid) + ']')
+        Write-Host ('expected ssid : [' + ($want -join ', ') + ']')
+        Write-Host ('wlan adapter  : ' + (Test-WlanAdapter))
+        Write-Host ('boot minutes  : ' + [int](Get-BootMinutes))
+        Write-Host ('auto switch   : ' + $cfg.wifiAutoSwitch)
+        Write-Host ('fix window    : ' + $cfg.wifiFixWindowMinutes + ' min')
+        Write-Host ('wait seconds  : ' + $cfg.wifiWaitSeconds)
+        if ($want.Count -eq 0) {
+            Write-Host 'note          : wifiSsid is empty - wifi checking is disabled'
+        } else {
+            foreach ($w in $want) {
+                Write-Host ('  profile "' + $w + '" saved   : ' + (Test-SsidProfile $w))
+                Write-Host ('  profile "' + $w + '" visible : ' + (Test-SsidVisible $w))
+            }
+        }
+        exit 0
+    }
+
+    # --- wifi sanity -------------------------------------------------------
+    # Must run BEFORE the reachability probe: on the wrong SSID the portal is
+    # unreachable by definition, and spending 150s waiting for it would only
+    # burn the boot window. Skipped under -Status so that a pure "show me"
+    # invocation never changes the machine's network state.
+    if (-not $Status) { Ensure-Wifi -Cfg $cfg }
+
+    # --- reachability ------------------------------------------------------
+    # A cold boot can take well over a minute before the portal answers: Wi-Fi
+    # association, DHCP and the PPPoE dial all have to settle first. The old
+    # 6 x 5s window was too short, so the logon-time run gave up and the
+    # machine sat offline until the next 5 minute watchdog tick. Probe for
+    # about 150s instead.
+    $reachTries = 30
+    $reachGap   = 5
+    if ($cfg.reachRetries)    { $reachTries = [int]$cfg.reachRetries }
+    if ($cfg.reachGapSeconds) { $reachGap   = [int]$cfg.reachGapSeconds }
     $st = $null
     $lastErr = ''
-    for ($i = 1; $i -le 6; $i++) {
+    for ($i = 1; $i -le $reachTries; $i++) {
         try { $st = Get-Status; break }
-        catch { $lastErr = $_.Exception.Message; Start-Sleep -Seconds 5 }
+        catch { $lastErr = $_.Exception.Message; Start-Sleep -Seconds $reachGap }
     }
     if (-not $st) {
         if (Test-Throttle 'lastUnreachable' 30) {
-            Write-Log ("portal unreachable: " + $lastErr) 'WARN'
+            Write-Log ("portal unreachable after " + $reachTries + " tries x " + $reachGap + "s: " + $lastErr) 'WARN'
         }
+        Write-Log ('run: portal unreachable, gave up after ' + $reachTries + ' tries') 'WARN'
         exit 3
     }
 
@@ -236,6 +442,7 @@ try {
             exit 0
         }
         if ($Force) { Write-Log 'already online - nothing to do' }
+        else { Write-Log ('run: online, dial=' + $st.dialCode + ', ip=' + $st.online.UserIpv4) }
         exit 0
     }
 
@@ -288,6 +495,9 @@ try {
                 Write-Log ('dial not confirmed: ' + $st2.dialCode + ' ' + $st2.dialMsg) 'WARN'
                 try { Invoke-Portal -Method POST -Path '/api/account/redial' | Out-Null; Write-Log 'redial sent' } catch { }
             }
+            $dialNow = 'unknown'
+            if ($st2) { $dialNow = [string]$st2.dialCode }
+            Write-Log ('run: logged in, dial=' + $dialNow)
             exit 0
         }
         1 {
@@ -297,7 +507,8 @@ try {
         }
         2 {
             Write-Log 'login requires a captcha - manual login needed' 'ERROR'
-            Show-Notify 'Campus network' 'Portal is asking for a captcha. Please log in manually once.'
+            Show-Notify 'Campus network' 'Portal is asking for a captcha. The login page has been opened - please finish it by hand.'
+            Show-PortalPage
             exit 6
         }
         default {
